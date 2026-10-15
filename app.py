@@ -57,6 +57,15 @@ with open(os.path.join(os.path.dirname(__file__), "specialist.json"), encoding="
 client = Anthropic()
 app = Flask(__name__)
 
+# Last webhook visits, viewable at /debug?key=TEST_KEY (helps when logs are empty)
+RECENT = []
+
+
+def remember(event):
+    RECENT.append({"time": time.strftime("%H:%M:%S", time.gmtime()) + " UTC", **event})
+    del RECENT[:-30]
+    print("WEBHOOK:", event, flush=True)
+
 
 # ---------------------------------------------------------------- memory
 def db():
@@ -260,10 +269,44 @@ def test():
     return jsonify(reply=reply, handed_to_master=handoff)
 
 
+GRAPH_BASE = os.environ.get("GRAPH_BASE", "https://graph.instagram.com/v21.0")
+
+
+@app.route("/subscribe")
+def subscribe():
+    """Subscribes the connected Instagram account to this app's 'messages' webhooks.
+    Meta sends NO DMs to the server until this is done (once per account)."""
+    if request.args.get("key") != TEST_KEY:
+        abort(403)
+    if not IG_ACCESS_TOKEN:
+        return jsonify(error="IG_ACCESS_TOKEN is not set on Render"), 400
+    auth = {"access_token": IG_ACCESS_TOKEN}
+    me = requests.get(f"{GRAPH_BASE}/me", params={**auth, "fields": "user_id,username"}, timeout=15)
+    if not me.ok:
+        return jsonify(step="read account", status=me.status_code, meta_says=me.json()), 400
+    info = me.json()
+    ig_id = info.get("user_id") or info.get("id")
+    sub = requests.post(f"{GRAPH_BASE}/{ig_id}/subscribed_apps",
+                        params={**auth, "subscribed_fields": "messages"}, timeout=15)
+    check = requests.get(f"{GRAPH_BASE}/{ig_id}/subscribed_apps", params=auth, timeout=15)
+    return jsonify(account=info.get("username"), ig_user_id=ig_id,
+                   subscribe_result=sub.json() if sub.content else sub.status_code,
+                   current_subscriptions=check.json() if check.content else check.status_code)
+
+
+@app.route("/debug")
+def debug():
+    if request.args.get("key") != TEST_KEY:
+        abort(403)
+    return jsonify(instagram_ready=bool(IG_ACCESS_TOKEN), recent_webhook_visits=RECENT[::-1])
+
+
 @app.route("/instagram/webhook", methods=["GET"])
 def verify():
-    if (request.args.get("hub.mode") == "subscribe"
-            and request.args.get("hub.verify_token") == VERIFY_TOKEN):
+    ok = (request.args.get("hub.mode") == "subscribe"
+          and request.args.get("hub.verify_token") == VERIFY_TOKEN)
+    remember({"type": "verify", "ok": ok})
+    if ok:
         return request.args.get("hub.challenge", ""), 200
     return "Verification failed", 403
 
@@ -272,9 +315,16 @@ def verify():
 def incoming():
     raw = request.get_data()
     if not signature_ok(raw):
+        remember({"type": "post", "rejected": "bad signature"})
         abort(403)
     payload = json.loads(raw or b"{}")
+    remember({"type": "post", "object": payload.get("object"),
+              "fields": [list(e.keys()) for e in payload.get("entry", [])],
+              "preview": raw[:300].decode("utf-8", "replace")})
     for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):   # Meta's "Test" button uses this format
+            if change.get("field") == "messages" and isinstance(change.get("value"), dict):
+                entry.setdefault("messaging", []).append(change["value"])
         for event in entry.get("messaging", []):
             msg = event.get("message") or {}
             if msg.get("is_echo") or msg.get("is_deleted"):
