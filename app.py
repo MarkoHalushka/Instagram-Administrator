@@ -210,6 +210,43 @@ def health():
                    instagram_ready=bool(IG_ACCESS_TOKEN), telegram_ready=bool(TG_TOKEN and TG_CHAT))
 
 
+CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
+PAGE_STYLE = ("<style>body{font-family:system-ui,Arial,sans-serif;max-width:720px;margin:40px auto;"
+              "padding:0 16px;line-height:1.6;color:#1f2937}h1{font-size:24px}h2{font-size:18px;margin-top:28px}</style>")
+
+
+@app.route("/privacy")
+def privacy():
+    return f"""<!doctype html><html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Privacy Policy</title>{PAGE_STYLE}</head><body>
+<h1>Privacy Policy / Політика конфіденційності</h1>
+<p>This service is an online assistant that answers Instagram Direct messages on behalf of beauty specialists who connected their Instagram professional account to it.</p>
+<h2>What data we process</h2>
+<p>The text of messages sent to the connected Instagram account, the sender's Instagram user ID, and booking details the sender chooses to share (name, phone number, preferred date and time).</p>
+<h2>Why</h2>
+<p>Only to reply to the sender, to pass booking requests to the specialist, and to keep conversation context. We do not sell data, show ads, or use it for any other purpose.</p>
+<h2>Who receives it</h2>
+<p>The specialist who owns the connected account (via Telegram notifications), and the AI provider Anthropic, which generates reply text. Data is stored on our server hosted by Render.</p>
+<h2>How long</h2>
+<p>Conversation history is kept up to 90 days, then deleted. You can ask for earlier deletion at any time.</p>
+<h2>Your rights / Видалення даних</h2>
+<p>To delete your data, follow the instructions at <a href="/data-deletion">/data-deletion</a>.</p>
+<h2>Contact</h2>
+<p>{CONTACT_EMAIL or "Contact the specialist via Instagram Direct."}</p>
+</body></html>"""
+
+
+@app.route("/data-deletion")
+def data_deletion():
+    return f"""<!doctype html><html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Data Deletion</title>{PAGE_STYLE}</head><body>
+<h1>Data deletion / Видалення даних</h1>
+<p>To delete all messages and booking details stored about you, send an email to {CONTACT_EMAIL or "the address on the privacy page"} with the subject "Delete my data" and your Instagram username, or write "видаліть мої дані" in Instagram Direct to the account you contacted.</p>
+<p>We delete the data within 30 days and confirm by reply.</p>
+<p>Щоб видалити ваші повідомлення та дані запису, напишіть «видаліть мої дані» в Direct акаунту, з яким ви листувалися, або на email вище. Ми видалимо дані протягом 30 днів.</p>
+</body></html>"""
+
+
 @app.route("/test", methods=["POST"])
 def test():
     if request.headers.get("X-Test-Key") != TEST_KEY:
