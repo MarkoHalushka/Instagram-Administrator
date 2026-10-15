@@ -1,10 +1,20 @@
 {
-  "_note": "DEMO data for testing. Replace with the real specialist's info.",
+  "_note": "DEMO data. schedule = working hours per weekday (\"вихідний\" = day off); closed_dates = extra days off like [\"2026-10-20\"]. The assistant checks bookings against these.",
   "name": "Оля",
   "brand": "Olya Nails",
   "city": "Львів",
   "address": "вул. Городоцька 15, 2 поверх (вхід з двору)",
   "hours": "Пн–Сб 9:00–19:00, неділя вихідний",
+  "schedule": {
+    "Пн": "09:00-19:00",
+    "Вт": "09:00-19:00",
+    "Ср": "09:00-19:00",
+    "Чт": "09:00-19:00",
+    "Пт": "09:00-19:00",
+    "Сб": "09:00-19:00",
+    "Нд": "вихідний"
+  },
+  "closed_dates": [],
   "portfolio": "запропонуй подивитися роботи в профілі: дописи та актуальні «Манікюр», «Педикюр», «Дизайн»; якщо потрібен конкретний дизайн — майстер скине приклади",
   "language": "uk",
   "tone": "дружньо, легко і коротко, на «ви», як жива адміністраторка в Instagram; максимум один емодзі, і не в кожному повідомленні",
