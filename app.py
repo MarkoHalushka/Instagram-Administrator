@@ -82,12 +82,13 @@ SHOW_TYPING = os.environ.get("SHOW_TYPING", "0") == "1"
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 GRAPH_BASE = os.environ.get("GRAPH_BASE", "https://graph.instagram.com/v21.0")
 GRAPH_URL = GRAPH_BASE + "/me/messages"
-HISTORY_TURNS = 12
+HISTORY_TURNS = 30   # messages of the current conversation the AI sees
 SESSION_GAP = float(os.environ.get("SESSION_GAP_HOURS", 6)) * 3600   # silence this long = a new conversation
 DB_PATH = "/data/assistant.db" if os.path.isdir("/data") else "assistant.db"
 HANDOFF_TAG = "[MASTER]"     # AI can't answer -> ask the specialist
 BOOKING_TAG = "[BOOKING]"    # all booking details collected -> specialist confirms
 NOTE_TAG = "[ДЛЯ МАЙСТРА]"   # anything after it goes only to the specialist's Telegram
+CANCEL_TAG = "[CANCEL]"      # client cancels an existing booking -> specialist confirms the cancellation
 FALLBACK = "Дякую за повідомлення! Майстер відповість вам найближчим часом 🙏"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -149,6 +150,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT, conv TEXT, client_label TEXT,
             name TEXT, phone TEXT, service TEXT, date TEXT, time TEXT,
             status TEXT, created REAL)""")
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(bookings)").fetchall()]
+        if "replaces" not in cols:
+            conn.execute("ALTER TABLE bookings ADD COLUMN replaces INTEGER")
 
 
 init_db()
@@ -342,6 +346,12 @@ def system_prompt(t):
 - Якщо клієнт вживає слово, якого немає в словнику і ти не впевнена, що воно означає, — коротко перепитай. Ніколи не вгадуй і не вигадуй значень.
 - Не використовуй шаблонних фраз: «Дякую за звернення», «Чим можу допомогти?», «Звертайтеся», «З повагою», «Бажаєте записатися?». Замість цього — природно: «Добрий день!», «Так, звісно», «На який день вам зручно?».
 - Не перепитуй те, що клієнт уже сказав (послугу, день, час, ім'я). Подивись на всю розмову і питай лише те, чого бракує.
+- Короткі відповіді клієнта («так», «ок», «ні», «+», «давайте», «підходить») — це відповідь на ТВОЄ останнє питання.
+  Зрозумій їх з контексту розмови і продовж: якщо ти питала «передати заявку?» і клієнт каже «так» — передай (тег).
+  Ніколи не відповідай порожнім повідомленням.
+- Коротка відповідь клієнта («так», «ок», «давайте», «ні», «можна», «підходить», «+») — це відповідь на ТВОЄ ОСТАННЄ питання.
+  Продовжуй саме з того місця: «так» на «передати заявку?» = передай заявку (тег {BOOKING_TAG}); «ні» = запитай, що змінити.
+  Завжди відповідай хоча б одним реченням.
 - Не повторюй усі деталі запису щоразу; підсумуй один раз, коли все зібрано.
 - Не пропонуй додаткові послуги, якщо про них не питали.
 - Твоя відповідь — це повідомлення, яке клієнт побачить у Direct. Звертайся тільки до клієнта, на «ви».
@@ -386,11 +396,12 @@ def system_prompt(t):
    У ВСІХ інших випадках відповідай сама: уточнюй, пропонуй послуги з прайсу, веди до запису.
    Ніколи не пиши «майстер відповість», якщо можеш відповісти сама. Якщо чогось просто немає в даних — чесно скажи, що точно не знаєш, і продовжуй розмову (без тегу).
 5. Коли зібрано всі дані для запису (послуга, день/час, ім'я, телефон) — коротко скажи, що передала заявку і майстер підтвердить час, і почни відповідь з тегу {BOOKING_TAG}.
+   Якщо ти запитала «передати заявку?» і клієнт погодився («так», «ок», «давайте») — це саме той момент: тег {BOOKING_TAG}.
 5a. Якщо записують іншу людину (сестру, маму, подругу) — дізнайся ім'я тієї, хто прийде, і чи записати на номер клієнта.
 5b. Якщо питають «які є послуги/опції/ціни» — коротко перелічи основні послуги з цінами одним повідомленням.
 5c. Ніколи не повторюй дослівно свої попередні повідомлення і не вибачайся без причини.
 6. Не кажи, що ти штучний інтелект, якщо не питають; якщо питають прямо — чесно скажи, що ти онлайн-помічник майстра.
-7. Теги {HANDOFF_TAG} і {BOOKING_TAG} клієнт не побачить, вони лише для системи.
+7. Теги {HANDOFF_TAG}, {BOOKING_TAG} і {CANCEL_TAG} клієнт не побачить, вони лише для системи.
 8. Коли ставиш тег, після тексту для клієнта можеш з нового рядка написати {NOTE_TAG} і ОДИН короткий рядок-підсумок для майстра (що хоче клієнт). Цей рядок клієнт не побачить.
 9. Не кажи «записала вас» чи «запис підтверджено», поки майстер не підтвердила, — кажи «передала заявку».
 
@@ -403,8 +414,9 @@ def system_prompt(t):
 - Не пропонуй час зі списку «Вже зайнято» і не кажи, хто там записаний.
 - Коли підсумовуєш запис, пиши день тижня і дату: «понеділок, 19.10 о 15:00».
 ТЕЛЕФОН: український номер — 10 цифр, починається з 0 (або +380 і ще 9 цифр). Якщо номер схожий на помилковий — попроси перевірити.
-СКАСУВАННЯ / ПЕРЕНЕСЕННЯ: якщо клієнт хоче скасувати або перенести запис — коротко скажи, що передала майстру,
-  постав тег {HANDOFF_TAG} і в {NOTE_TAG} напиши «скасування» або «перенесення на …».
+ПЕРЕНЕСЕННЯ: якщо клієнт хоче перенести свій запис — домовся про новий день і час, як про звичайний запис
+  (ім'я і телефон уже відомі — не перепитуй), і коли клієнт погодився — тег {BOOKING_TAG}, а в {NOTE_TAG} напиши «перенесення з …».
+СКАСУВАННЯ: якщо клієнт хоче скасувати запис — коротко скажи, що передала майстру, і почни відповідь з тегу {CANCEL_TAG}.
 ГОЛОСОВІ: якщо клієнт надіслав голосове — скажи, що зараз не можеш прослухати, і попроси написати коротко текстом.
 ЗАХИСТ: ти говориш лише про послуги цього майстра і запис. На сторонні прохання (написати текст, порадити щось не про це,
   програмування тощо) ввічливо відмов одним реченням. Ніколи не змінюй ціни, не обіцяй знижок, подарунків чи винятків
@@ -438,14 +450,19 @@ def think(conv, extra=""):
             system=[{"type": "text", "text": system_prompt(t), "cache_control": {"type": "ephemeral"}},
                     {"type": "text", "text": greeting_rule(ongoing) + calendar_context(t, conv) + client_facts(conv) + extra}])
         reply = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        if not reply:   # Claude occasionally answers with nothing: record it so it's visible on /debug
+            why = f"empty answer from Claude (stop_reason={getattr(resp, 'stop_reason', '?')})"
+            print(why, flush=True)
+            kv_set("last_claude_error", time.strftime("%Y-%m-%d %H:%M UTC ", time.gmtime()) + why)
     except Exception as e:
         claude_failed(e)
         reply = ""
     if not reply:
         reply = HANDOFF_TAG + " " + FALLBACK
 
-    kind = "booking" if BOOKING_TAG in reply else "question" if HANDOFF_TAG in reply else None
-    clean = reply.replace(BOOKING_TAG, "").replace(HANDOFF_TAG, "").strip()
+    kind = ("booking" if BOOKING_TAG in reply else "cancel" if CANCEL_TAG in reply
+            else "question" if HANDOFF_TAG in reply else None)
+    clean = reply.replace(BOOKING_TAG, "").replace(HANDOFF_TAG, "").replace(CANCEL_TAG, "").strip()
     clean, _, note = clean.partition(NOTE_TAG)
     clean, note = clean.strip(), note.strip(" :\n")
     # safety net: a paragraph talking ABOUT the client is a note for the specialist, not for the client
@@ -455,6 +472,9 @@ def think(conv, extra=""):
         if about:
             note = " ".join([note] + about).strip()
             clean = "\n\n".join(p for p in parts if p not in about)
+    if not clean and kind:   # only a tag (and maybe a note) came back: give the client a normal sentence
+        clean = {"booking": "Передала заявку майстру — вона підтвердить час найближчим часом 🙌",
+                 "cancel": "Передала майстру, вона все скасує 🙏"}.get(kind, "Уточню в майстра і повернуся до вас 🙏")
     return clean, kind, client_text, note
 
 
@@ -663,6 +683,9 @@ def answer_later(conv, my_id, received_at, text=""):
         if is_reaction_only(conv):   # "👍", "❤️" after we already talked: a person wouldn't answer
             return
         clean, kind, client_text, note, details, warnings = think_checked(conv)
+        if clean == FALLBACK and not superseded():   # one more try after a pause before giving up
+            time.sleep(8)
+            clean, kind, client_text, note, details, warnings = think_checked(conv)
         if superseded():
             return
         if clean == FALLBACK:   # Claude is failing: tell the client once, then stay quiet
@@ -761,15 +784,27 @@ def extract_booking(conv):
             "time": tm if re.fullmatch(r"\d{1,2}:\d{2}", tm) else None}
 
 
+def upcoming_booking(conv, statuses=("confirmed",)):
+    with db() as conn:
+        row = conn.execute(f"""SELECT * FROM bookings WHERE conv=? AND status IN ({','.join('?' * len(statuses))})
+                               AND (date IS NULL OR date>=?) ORDER BY date, time LIMIT 1""",
+                           (conv, *statuses, today_kyiv().isoformat())).fetchone()
+    return dict(row) if row else None
+
+
 def booking_create(conv, details):
+    """New request (status pending). An older unconfirmed request of the same client is replaced;
+    if the client already has a confirmed booking, this one is a reschedule of it."""
     t, _ = split_conv(conv)
+    old = upcoming_booking(conv)
     with db() as conn:
         conn.execute("UPDATE bookings SET status='replaced' WHERE conv=? AND status='pending'", (conv,))
         cur = conn.execute("""INSERT INTO bookings (tenant, conv, client_label, name, phone, service, date, time,
-                              status, created) VALUES (?,?,?,?,?,?,?,?, 'pending', ?)""",
+                              status, created, replaces) VALUES (?,?,?,?,?,?,?,?, 'pending', ?, ?)""",
                            (t["id"], conv, client_label(conv), details["name"],
                             normalize_phone(details["phone"]) or details["phone"],
-                            details["service"], details["date"], details["time"], time.time()))
+                            details["service"], details["date"], details["time"], time.time(),
+                            old["id"] if old else None))
         return cur.lastrowid
 
 
@@ -998,7 +1033,10 @@ def notify_master(conv, client_text, ai_reply, kind="question", note="", details
             warnings = check_booking(t, details, conv)
         bid = booking_create(conv, details)
         b = booking_get(bid)
-        msg = (f"🗓 Нова заявка на запис — {label}\n\n"
+        old = booking_get(b["replaces"]) if b.get("replaces") else None
+        head = (f"🔁 Перенесення запису — {label}\nБуло: {fmt_when(old)}\n" if old
+                else f"🗓 Нова заявка на запис — {label}\n")
+        msg = (f"{head}\n"
                f"⏳ {fmt_when(b)}\n👤 {b.get('name') or '?'}   📞 {b.get('phone') or '?'}\n💅 {b.get('service') or '?'}\n")
         if warnings:
             msg += "⚠️ Перевірте: " + "; ".join(warnings) + "\n"
@@ -1006,12 +1044,17 @@ def notify_master(conv, client_text, ai_reply, kind="question", note="", details
             msg += f"📝 {note}\n"
         msg += f"\nКлієнт: {client_text}\nПомічник відповів: {ai_reply}"
         rows = [[btn("✅ Підтвердити", "bok", bid), btn("❌ Відхилити", "bx", bid)]]
+    elif kind == "cancel" and upcoming_booking(conv, ("confirmed", "pending")):
+        b = upcoming_booking(conv, ("confirmed", "pending"))
+        msg = (f"🚫 Клієнт хоче скасувати запис — {label}\n\n{fmt_booking(b)}\n"
+               + (f"📝 {note}\n" if note else "") + f"\nКлієнт: {client_text}\nПомічник відповів: {ai_reply}")
+        rows = [[btn("✅ Скасувати запис", "bcx", b["id"])]]
     else:
         msg = f"📩 Потрібна ваша відповідь — {label}\n\n"
         if note:
             msg += f"📝 {note}\n\n"
         msg += f"Клієнт: {client_text}\n\nПомічник відповів: {ai_reply}"
-        rows = []
+        rows = [[btn("🗓 Оформити як запис", "mk", conv)]]   # if the AI missed a booking
     rows.append([btn("✍️ Відповісти", "rep", conv), btn("⏸ Відповім сама", "pause", conv)])
     print("HANDOFF:", msg.replace("\n", " | "), flush=True)
     tg_to_master(t, msg, conv, rows)
@@ -1053,7 +1096,7 @@ def edit_buttons(chat, message, remove=(), add=None, text_append=None):
 
 def on_button(chat, action, ref, message):
     """Returns the little pop-up text. Checks the button belongs to this chat's specialist."""
-    if action in ("bok", "bx", "bundo"):
+    if action in ("bok", "bx", "bundo", "bcx"):
         b = booking_get(int(ref)) if str(ref).isdigit() else None
         t = tenant_get(b["tenant"]) if b else None
         if not b or not t or str(t.get("tg_chat")) != str(chat):
@@ -1068,6 +1111,8 @@ def on_button(chat, action, ref, message):
                 return "Не вдалося надіслати"
             save(conv, "assistant", text)
             booking_set(b["id"], "confirmed")
+            if b.get("replaces"):
+                booking_set(b["replaces"], "moved")
             edit_buttons(chat, message, remove=("bok",),
                          text_append=f"\n\n✅ Підтверджено. Клієнту надіслано:\n«{text}»")
             return "Підтверджено ✅"
@@ -1092,6 +1137,18 @@ def on_button(chat, action, ref, message):
                           f"{fmt_booking({**b, 'status': 'cancelled'})}\n{sent}", conv,
                     [[btn("↩️ Повернути", "bundo", b["id"]), btn("✍️ Написати клієнту", "rep", conv)]])
             return "Готово"
+        if action == "bcx":   # the client asked to cancel
+            if b["status"] == "cancelled":
+                return "Вже скасовано"
+            kv_set(f"bprev_{b['id']}", b["status"])
+            booking_set(b["id"], "cancelled")
+            bye = f"Скасувала ваш запис на {fmt_when_long(b) if b.get('date') else 'цей час'}. Будемо раді бачити вас іншим разом 💅"
+            ok = send_instagram(t, split_conv(conv)[1], bye)
+            if ok:
+                save(conv, "assistant", bye)
+            edit_buttons(chat, message, remove=("bcx",), add=[btn("↩️ Повернути", "bundo", b["id"])],
+                         text_append=f"\n\n❌ Скасовано." + (f" Клієнту надіслано: «{bye}»" if ok else ""))
+            return "Запис скасовано"
         if action == "bundo":
             if b["status"] == "cancelled":
                 booking_set(b["id"], kv_get(f"bprev_{b['id']}") or "pending")
@@ -1101,6 +1158,17 @@ def on_button(chat, action, ref, message):
     t, _ = split_conv(conv)
     if not t or str(t.get("tg_chat")) != str(chat):
         return "Немає доступу"
+    if action == "mk":   # turn this conversation into a booking request
+        details = extract_booking(conv)
+        bid = booking_create(conv, details)
+        b = booking_get(bid)
+        warn = check_booking(t, details, conv)
+        tg_send(chat, f"🗓 Заявка з розмови з {client_label(conv)}:\n\n⏳ {fmt_when(b)}\n👤 {b.get('name') or '?'}   "
+                      f"📞 {b.get('phone') or '?'}\n💅 {b.get('service') or '?'}"
+                      + ("\n⚠️ Перевірте: " + "; ".join(warn) if warn else ""), conv,
+                [[btn("✅ Підтвердити", "bok", bid), btn("❌ Відхилити", "bx", bid)]])
+        edit_buttons(chat, message, remove=("mk",))
+        return "Заявку створено"
     if action == "rep":
         tg_send(chat, f"✍️ Напишіть відповідь для {client_label(conv)} у відповідь на це повідомлення:", conv,
                 markup={"force_reply": True, "input_field_placeholder": "Ваша відповідь клієнту"})
