@@ -91,7 +91,7 @@ def load_glossary():
 
 GLOSSARY = load_glossary()
 
-client = Anthropic()
+client = Anthropic(max_retries=4)   # Anthropic is sometimes briefly overloaded: retry before giving up
 app = Flask(__name__)
 
 # Last webhook visits, viewable at /debug?key=TEST_KEY (helps when logs are empty)
@@ -147,7 +147,8 @@ def history(user_id):
         rows = conn.execute(
             "SELECT role, text FROM messages WHERE user_id=? ORDER BY ts DESC LIMIT ?",
             (user_id, HISTORY_TURNS)).fetchall()
-    msgs = [{"role": r, "content": t} for r, t in reversed(rows)]
+    msgs = [{"role": r, "content": t} for r, t in reversed(rows)
+            if not (r == "assistant" and t.startswith("Дякую за повідомлення! Майстер відповість"))]
     # Claude needs the conversation to start with the user and alternate roles
     while msgs and msgs[0]["role"] != "user":
         msgs.pop(0)
@@ -220,8 +221,17 @@ def system_prompt():
 2. Ти НЕ знаєш вільних вікон. Збери бажаний день і час, ім'я, телефон і напиши, що майстер підтвердить час найближчим часом.
 3. Якщо клієнт надіслав фото дизайну — скажи, що майстер подивиться і назве точну ціну.
    Якщо просять фото робіт — {portfolio}. Не кажи, що в тебе «немає фото під рукою».
-4. Якщо питання не покривається даними, клієнт незадоволений, скарга, щось медичне, або клієнт просить живу людину — ввічливо скажи, що передаєш питання майстру, і почни відповідь з тегу {HANDOFF_TAG}.
+4. Ти САМА ведеш розмову до запису. Передавай майстру (тег {HANDOFF_TAG}) ТІЛЬКИ в цих випадках:
+   - скарга або клієнт незадоволений;
+   - щось медичне (алергія, травма, грибок, врослий ніготь, вагітність);
+   - клієнт прямо просить живу людину / майстра;
+   - потрібна точна ціна складного дизайну за фото.
+   У ВСІХ інших випадках відповідай сама: уточнюй, пропонуй послуги з прайсу, веди до запису.
+   Ніколи не пиши «майстер відповість», якщо можеш відповісти сама. Якщо чогось просто немає в даних — чесно скажи, що точно не знаєш, і продовжуй розмову (без тегу).
 5. Коли зібрано всі дані для запису (послуга, день/час, ім'я, телефон) — коротко скажи, що передала заявку і майстер підтвердить час, і почни відповідь з тегу {BOOKING_TAG}.
+5a. Якщо записують іншу людину (сестру, маму, подругу) — дізнайся ім'я тієї, хто прийде, і чи записати на номер клієнта.
+5b. Якщо питають «які є послуги/опції/ціни» — коротко перелічи основні послуги з цінами одним повідомленням.
+5c. Ніколи не повторюй дослівно свої попередні повідомлення і не вибачайся без причини.
 6. Не кажи, що ти штучний інтелект, якщо не питають; якщо питають прямо — чесно скажи, що ти онлайн-помічник майстра.
 7. Теги {HANDOFF_TAG} і {BOOKING_TAG} клієнт не побачить, вони лише для системи.
 8. Коли ставиш тег, після тексту для клієнта можеш з нового рядка написати {NOTE_TAG} і ОДИН короткий рядок-підсумок для майстра (що хоче клієнт). Цей рядок клієнт не побачить."""
@@ -239,7 +249,8 @@ def ask_claude(user_id, text):
 
 
 def finish(user_id, clean, kind, client_text, note=""):
-    save(user_id, "assistant", clean)
+    if clean != FALLBACK:   # the emergency reply must not become an example Claude copies
+        save(user_id, "assistant", clean)
     if kind:
         notify_master(user_id, client_text, clean, kind, note)
 
@@ -263,6 +274,7 @@ def think(user_id):
         reply = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
     except Exception as e:
         print(f"Claude error: {e}", flush=True)
+        kv_set("last_claude_error", time.strftime("%Y-%m-%d %H:%M UTC ", time.gmtime()) + str(e)[:500])
         err = str(e).lower()
         if "credit balance" in err or "billing" in err:
             alert_admin("💳 Закінчився баланс Anthropic — помічник не може відповідати. "
@@ -312,6 +324,11 @@ def answer_later(sender, my_id, received_at, text=""):
         clean, kind, client_text, note = think(sender)
         if superseded():
             return
+        if clean == FALLBACK:
+            # Claude is failing. Tell the client once, then stay quiet (no spam) until it works again.
+            if time.time() - float(kv_get(f"fallback_{sender}", 0)) < 6 * 3600:
+                return
+            kv_set(f"fallback_{sender}", time.time())
         wait = human_delay(clean) - (time.time() - received_at)
         if wait > 1 and SHOW_TYPING:
             sender_action(sender, "mark_seen")
@@ -740,7 +757,8 @@ def subscribe():
 def debug():
     if request.args.get("key") != TEST_KEY:
         abort(403)
-    return jsonify(instagram_token=token_status(), recent_webhook_visits=RECENT[::-1])
+    return jsonify(instagram_token=token_status(), last_claude_error=kv_get("last_claude_error"),
+                   recent_webhook_visits=RECENT[::-1])
 
 
 @app.route("/telegram/setup")
@@ -767,6 +785,17 @@ def telegram_webhook():
     update = request.get_json(silent=True) or {}
     threading.Thread(target=handle_telegram, args=(update,), daemon=True).start()
     return "ok", 200
+
+
+@app.route("/reset")
+def reset_conversations():
+    """TESTING: forget all conversations (e.g. before recording a demo)."""
+    if request.args.get("key") != TEST_KEY:
+        abort(403)
+    with db() as conn:
+        n = conn.execute("DELETE FROM messages").rowcount
+        conn.execute("DELETE FROM kv WHERE key LIKE 'pause_%' OR key LIKE 'fallback_%' OR key LIKE 'latest_%'")
+    return jsonify(deleted_messages=n)
 
 
 @app.route("/renew-token")
