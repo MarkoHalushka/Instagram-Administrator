@@ -72,6 +72,25 @@ SHOW_TYPING = os.environ.get("SHOW_TYPING", "0") == "1"   # "seen" + "typing…"
 with open(os.path.join(os.path.dirname(__file__), "specialist.json"), encoding="utf-8") as f:
     SPECIALIST = json.load(f)
 
+
+def load_glossary():
+    """glossary.json -> compact text for the prompt (nail terms, slang, short forms)."""
+    path = os.path.join(os.path.dirname(__file__), "glossary.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    lines = []
+    for g in data.get("groups", []):
+        lines.append(f"{g['group']}:")
+        for t in g["terms"]:
+            aka = ", ".join(a for a in t.get("aka", []) if a.lower() != t["term"].lower())
+            lines.append(f"- {t['term']}" + (f" ({aka})" if aka else "") + f" — {t['meaning']}")
+    return "\n".join(lines)
+
+
+GLOSSARY = load_glossary()
+
 client = Anthropic()
 app = Flask(__name__)
 
@@ -142,21 +161,28 @@ def history(user_id):
 
 
 # ---------------------------------------------------------------- the AI
-def system_prompt(ongoing=False):
+def greeting_rule(ongoing):
+    return ("ЗАРАЗ: розмова вже триває і ви вже віталися — НЕ вітайся знову, одразу відповідай по суті."
+            if ongoing else "ЗАРАЗ: це початок розмови — можна коротко привітатися.")
+
+
+def system_prompt():
+    """The fixed instructions (cached by Anthropic, so the long glossary costs little)."""
     s = SPECIALIST
     portfolio = s.get("portfolio") or "приклади робіт є в нашому профілі Instagram"
-    greeting = ("Розмова вже триває і ви вже віталися: НЕ вітайся знову, одразу відповідай по суті."
-                if ongoing else "Це початок розмови: можна коротко привітатися.")
     services = "\n".join(f"- {x['name']}: {x['price']}, {x['duration']}" for x in s["services"])
     extras = "\n".join(f"- {x['name']}: {x['price']}" for x in s["extras"])
     faq = "\n".join(f"- {x['q']} -> {x['a']}" for x in s["faq"])
     return f"""Ти — адміністраторка майстра манікюру {s['name']} ({s['brand']}, {s['city']}) і відповідаєш у Instagram Direct.
 Ти жінка: завжди говори про себе в жіночому роді («записала», «передала», «уточню»).
 Стиль: {s['tone']}. Пиши мовою клієнта (за замовчуванням українською). Відповіді короткі: 1–2 речення, максимум 3.
-{greeting}
 
 ЯК ПИСАТИ:
-- Пиши як жива людина в Instagram, просто і тепло, без канцеляриту.
+- Пиши як жива людина в Instagram, просто і тепло, без канцеляриту — розмовною українською, як у переписці з подругою, але на «ви».
+- Не використовуй книжних і офіційних слів: «зокрема», «наразі», «даний», «здійснити», «відповідно», «з метою», «надати», «оформити». Короткі прості речення, звичайний порядок слів.
+- Розумій професійні терміни і сленг зі СЛОВНИКА нижче і вживай їх природно, як майстри (можна «гелька», «комбі», «нарощ», якщо так пише клієнт).
+- Якщо клієнт питає, що означає якесь слово, поясни просто, одним-двома реченнями, за словником.
+- Якщо клієнт вживає слово, якого немає в словнику і ти не впевнена, що воно означає, — коротко перепитай. Ніколи не вгадуй і не вигадуй значень.
 - Не використовуй шаблонних фраз: «Дякую за звернення», «Чим можу допомогти?», «Звертайтеся», «З повагою», «Бажаєте записатися?». Замість цього — природно: «Добрий день!», «Так, звісно», «На який день вам зручно?».
 - Не перепитуй те, що клієнт уже сказав (послугу, день, час, ім'я). Подивись на всю розмову і питай лише те, чого бракує.
 - Не повторюй усі деталі запису щоразу; підсумуй один раз, коли все зібрано.
@@ -168,6 +194,9 @@ def system_prompt(ongoing=False):
 Приклади тону:
 Клієнт: «Скільки коштує манікюр з покриттям?» → «Добрий день! Манікюр з покриттям — 600 грн, займає приблизно 1 год 45 хв. На який день вам зручно?»
 Клієнт: «Хочу на суботу на 12» → «Супер, субота о 12:00. Підкажіть, будь ласка, ваше ім'я і номер телефону?»
+Клієнт: «А матовий топ і дизайн на педикюр можна?» → «Так, звісно! Матовий топ +50 грн, а дизайн залежить від складності — скиньте фото, і майстер скаже точну ціну.»
+Клієнт: «А що таке комбі?» → «Це коли кутикулу обробляють і апаратом, і ножичками — так акуратніше і довше тримається вигляд 🙂»
+Клієнт: «Є фото робіт?» → «Так, роботи є в профілі — в дописах і в актуальних 💅 Якщо шукаєте щось конкретне, скиньте приклад.»
 
 ДАНІ МАЙСТРА (єдине джерело правди):
 Адреса: {s['address']}
@@ -181,6 +210,10 @@ def system_prompt(ongoing=False):
 Скасування: {s['cancel_rule']}
 Часті питання:
 {faq}
+
+СЛОВНИК (пояснює слова; ціни і чи є послуга — ТІЛЬКИ з даних майстра вище.
+Якщо послуги немає в прайсі — поясни, що це, і скажи, що уточниш у майстра):
+{GLOSSARY}
 
 ПРАВИЛА:
 1. Ніколи не вигадуй ціни, послуги, знижки чи вільні вікна. Якщо чогось немає в даних — не вгадуй.
@@ -224,7 +257,9 @@ def think(user_id):
     ongoing = bool(last_ours) and time.time() - last_ours < 12 * 3600
     try:
         resp = client.messages.create(
-            model=MODEL, max_tokens=400, system=system_prompt(ongoing), messages=msgs)
+            model=MODEL, max_tokens=400, messages=msgs,
+            system=[{"type": "text", "text": system_prompt(), "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": greeting_rule(ongoing)}])
         reply = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
     except Exception as e:
         print(f"Claude error: {e}", flush=True)
