@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import sqlite3
 import sys
 import threading
@@ -54,6 +55,8 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 ADMIN_CHAT = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "") or TG_CHAT
 TOKEN_RENEW_EVERY = 5 * 86400   # renew the Instagram token every 5 days
 TOKEN_CHECK_EVERY = 6 * 3600    # look at it every 6 hours
+MIN_DELAY = float(os.environ.get("MIN_DELAY", 2))    # seconds before a short reply
+MAX_DELAY = float(os.environ.get("MAX_DELAY", 10))   # seconds before a long reply
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 GRAPH_URL = os.environ.get("GRAPH_URL", "https://graph.instagram.com/v21.0/me/messages")
 HISTORY_TURNS = 12
@@ -180,10 +183,27 @@ FALLBACK = "Дякую за повідомлення! Майстер відпо�
 
 
 def ask_claude(user_id, text):
+    """Instant version (used by /test): save, think, finish."""
     save(user_id, "user", text)
+    clean, handoff, client_text = think(user_id)
+    finish(user_id, clean, handoff, client_text)
+    return clean, handoff
+
+
+def finish(user_id, clean, handoff, client_text):
+    save(user_id, "assistant", clean)
+    if handoff:
+        notify_master(user_id, client_text, clean)
+
+
+def think(user_id):
+    """Asks Claude about the whole conversation. Saves nothing.
+    Returns (reply without tag, handoff?, what the client wrote since our last reply)."""
+    msgs = history(user_id)
+    client_text = msgs[-1]["content"] if msgs and msgs[-1]["role"] == "user" else ""
     try:
         resp = client.messages.create(
-            model=MODEL, max_tokens=500, system=system_prompt(), messages=history(user_id))
+            model=MODEL, max_tokens=500, system=system_prompt(), messages=msgs)
         reply = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
     except Exception as e:
         print(f"Claude error: {e}", flush=True)
@@ -201,10 +221,39 @@ def ask_claude(user_id, text):
 
     handoff = reply.startswith(HANDOFF_TAG)
     clean = reply.replace(HANDOFF_TAG, "").strip()
-    save(user_id, "assistant", clean)
-    if handoff:
-        notify_master(user_id, text, clean)
-    return clean, handoff
+    return clean, handoff, client_text
+
+
+# ---------------------------------------------------------------- human-like timing
+def human_delay(reply):
+    """Seconds between the client's message and our reply, counted from when it arrived.
+    ~30 chars -> ~3 s, ~100 -> ~5 s, ~200 -> ~9 s, longer -> 10 s, plus a little randomness."""
+    return max(MIN_DELAY, min(MAX_DELAY, 1.5 + len(reply) / 25 + random.uniform(-0.5, 0.8)))
+
+
+def answer_later(sender, my_id, received_at):
+    """Runs in the background so Meta gets its 'ok' at once. If the client sends
+    another message before we reply, this answer is dropped and the newest one
+    answers everything together (like a person reading all messages first)."""
+    try:
+        def superseded():
+            return kv_get(f"latest_{sender}") != my_id
+
+        clean, handoff, client_text = think(sender)
+        if superseded():
+            return
+        wait = human_delay(clean) - (time.time() - received_at)
+        if wait > 1:
+            sender_action(sender, "mark_seen")
+            time.sleep(min(1.0, wait / 3))
+            sender_action(sender, "typing_on")
+            time.sleep(max(0, human_delay(clean) - (time.time() - received_at)))
+        if superseded():
+            return
+        finish(sender, clean, handoff, client_text)
+        send_instagram(sender, clean)
+    except Exception as e:  # a background error must never crash the server
+        print(f"Reply error for {sender}: {e}", flush=True)
 
 
 # ---------------------------------------------------------------- outside world
@@ -298,6 +347,20 @@ def token_keeper():
         except Exception as e:  # never let this thread die
             print(f"Token keeper error: {e}", flush=True)
         time.sleep(TOKEN_CHECK_EVERY)
+
+
+def sender_action(recipient_id, action):
+    """'mark_seen' / 'typing_on' in the client's Instagram. Nice to have; failures are ignored."""
+    token = ig_token()
+    if not token:
+        return
+    try:
+        r = requests.post(GRAPH_URL, headers={"Authorization": f"Bearer {token}"},
+                          json={"recipient": {"id": recipient_id}, "sender_action": action}, timeout=10)
+        if not r.ok:
+            print(f"Sender action {action} failed {r.status_code}: {r.text[:200]}", flush=True)
+    except requests.RequestException:
+        pass
 
 
 def send_instagram(recipient_id, text):
@@ -466,8 +529,11 @@ def incoming():
                 text = "[Клієнт надіслав фото/вкладення]"
             if not text:
                 continue
-            reply, _ = ask_claude(sender, text)
-            send_instagram(sender, reply)
+            received_at = time.time()
+            my_id = str(msg.get("mid") or received_at)
+            save(sender, "user", text)
+            kv_set(f"latest_{sender}", my_id)
+            threading.Thread(target=answer_later, args=(sender, my_id, received_at), daemon=True).start()
     return "ok", 200  # always 200 quickly, or Meta retries
 
 
