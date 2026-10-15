@@ -82,6 +82,7 @@ SHOW_TYPING = os.environ.get("SHOW_TYPING", "0") == "1"
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 GRAPH_BASE = os.environ.get("GRAPH_BASE", "https://graph.instagram.com/v21.0")
 GRAPH_URL = GRAPH_BASE + "/me/messages"
+MAX_OUT = int(os.environ.get("MAX_OUTPUT_TOKENS", 2000))   # room for the model to think AND answer
 HISTORY_TURNS = 30   # messages of the current conversation the AI sees
 SESSION_GAP = float(os.environ.get("SESSION_GAP_HOURS", 6)) * 3600   # silence this long = a new conversation
 DB_PATH = "/data/assistant.db" if os.path.isdir("/data") else "assistant.db"
@@ -116,6 +117,24 @@ GLOSSARY = load_glossary()
 client = Anthropic(max_retries=4)
 app = Flask(__name__)
 RECENT = []  # last webhook visits, shown on /debug
+_last = threading.local()   # details of the last Claude call in this thread (for /selftest diagnostics)
+
+
+def model_now():
+    return getattr(_last, "model", None) or MODEL
+
+
+def answer_text(resp, what):
+    """Text of a Claude answer; records why it might be empty or cut off."""
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+    stop = getattr(resp, "stop_reason", "?")
+    _last.meta = {"stop": stop, "blocks": [getattr(b, "type", "?") for b in resp.content],
+                  "out_tokens": getattr(getattr(resp, "usage", None), "output_tokens", None)}
+    if stop == "max_tokens" or not text:
+        why = f"{what}: {'cut off (max_tokens)' if stop == 'max_tokens' else 'empty answer'} {_last.meta}"
+        print(why, flush=True)
+        kv_set("last_claude_error", time.strftime("%Y-%m-%d %H:%M UTC ", time.gmtime()) + why)
+    return text
 
 
 def remember(event):
@@ -323,8 +342,9 @@ def transcript(conv):
 
 # ---------------------------------------------------------------- the AI
 def greeting_rule(ongoing):
-    return ("ЗАРАЗ: розмова вже триває і ви вже віталися — НЕ вітайся знову, одразу відповідай по суті."
-            if ongoing else "ЗАРАЗ: це початок розмови — можна коротко привітатися.")
+    return (("ЗАРАЗ: розмова вже триває і ви вже віталися — НЕ вітайся знову, одразу відповідай по суті."
+             if ongoing else "ЗАРАЗ: це початок розмови — можна коротко привітатися.")
+            + " Ніколи не пиши «Чим можу допомогти?» — питай конкретно (послуга, день, час).")
 
 
 def system_prompt(t):
@@ -354,6 +374,25 @@ def system_prompt(t):
 - Твоя відповідь — це повідомлення, яке клієнт побачить у Direct. Звертайся тільки до клієнта, на «ви».
   Ніколи не пиши в ній нотаток, підсумків чи інструкцій для майстра і не говори про клієнта в третій особі.
 - Не вгадуй стать клієнта за іменем; якщо невідомо — пиши нейтрально.
+- Майстра називай на ім'я ({s.get('name', '')}), а студію — назвою ({s.get('brand', '')}). Не змішуй їх («майстра Оля Nails» — неправильно).
+
+ЖИВА УКРАЇНСЬКА (найважливіше після правил запису):
+Пиши так, як пише жива українка-адміністраторка, а не як перекладач. НЕ калькуй з англійської чи російської.
+Замість кальки — природний варіант:
+- «звучить добре / звучить чудово» (sounds good) → «чудово», «супер», «домовились», «підходить»
+- «дайте знати» (let me know) → «напишіть», «скажіть»
+- «маєте гарний день» → «гарного дня!»
+- «не соромтеся звертатися» → (не пиши взагалі)
+- «на даний момент» → «зараз»; «згідно з прайсом» → «за прайсом»
+- «по питанню / на рахунок» → «щодо»; «по ціні» → «ціна —»
+- «вибачаюсь» → «перепрошую» або «вибачте»; «слідуючий» → «наступний»; «співпадає» → «збігається»
+- «являється» → «є»; «відноситься до» → «стосується»; «на протязі» → «протягом»; «приймати участь» → «брати участь»
+- «самий кращий» → «найкращий»; «вірно» → «правильно»; «заказати» → «замовити»; «пара днів» → «кілька днів»
+- «зручно для вас» → «вам зручно»; «бажаєте…?» → «хочете…?» або просто питання
+- «майстер зв'яжеться з вами найближчим часом» → «майстер скоро напише вам»
+Звертайся у кличному відмінку: «Марку», «Олено», «Ірино», «Анно» (а не «Марко!» як звертання — хоча якщо не впевнена у формі, просто без імені).
+Приклади природних фраз: «Супер, тоді понеділок, 19.10 о 12:00 🙂», «Домовились!», «Так, звісно», «Без проблем»,
+«Підкажіть, будь ласка…», «Гляньте, будь ласка…», «Скиньте фото — майстер подивиться».
 
 Приклади тону:
 Клієнт: «Скільки коштує манікюр з покриттям?» → «Добрий день! Манікюр з покриттям — 600 грн, займає приблизно 1 год 45 хв. На який день вам зручно?»
@@ -445,14 +484,12 @@ def think(conv, extra=""):
     ongoing = any(r["role"] == "assistant" for r in session_rows(conv))
     try:
         resp = client.messages.create(
-            model=MODEL, max_tokens=400, messages=msgs,
+            model=model_now(), max_tokens=MAX_OUT, messages=msgs,
             system=[{"type": "text", "text": system_prompt(t), "cache_control": {"type": "ephemeral"}},
                     {"type": "text", "text": greeting_rule(ongoing) + calendar_context(t, conv) + client_facts(conv) + extra}])
-        reply = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        if not reply:   # Claude occasionally answers with nothing: record it so it's visible on /debug
-            why = f"empty answer from Claude (stop_reason={getattr(resp, 'stop_reason', '?')})"
-            print(why, flush=True)
-            kv_set("last_claude_error", time.strftime("%Y-%m-%d %H:%M UTC ", time.gmtime()) + why)
+        reply = answer_text(resp, "reply")
+        if getattr(resp, "stop_reason", "") == "max_tokens":
+            reply = ""   # a cut-off answer must never reach the client: treat as failed and retry
     except Exception as e:
         claude_failed(e)
         reply = ""
@@ -471,10 +508,34 @@ def think(conv, extra=""):
         if about:
             note = " ".join([note] + about).strip()
             clean = "\n\n".join(p for p in parts if p not in about)
+    clean = polish(clean)
     if not clean and kind:   # only a tag (and maybe a note) came back: give the client a normal sentence
         clean = {"booking": "Передала заявку майстру — вона підтвердить час найближчим часом 🙌",
                  "cancel": "Передала майстру, вона все скасує 🙏"}.get(kind, "Уточню в майстра і повернуся до вас 🙏")
     return clean, kind, client_text, note
+
+
+STOCK_PHRASES = [(r"[—–-]?\s*звучить (дуже )?(добре|чудово|супер|класно)[.!]?", " — чудово!"),
+                 (r"\bмаєте (гарний|чудовий) день\b", "гарного дня"),
+                 (r"\bне соромтеся (звертатися|писати)[^.!?]*[.!?]?", ""),
+                 (r"\bна даний момент\b", "зараз"),
+                 (r"\bзгідно з прайсом\b", "за прайсом"),(r"\s*Чим (я )?можу (вам )?допомогти\??\s*:", " Що вас цікавить:"),
+                 (r"\s*Чим (я )?можу (вам )?допомогти\??", " Що саме вас цікавить?"),
+                 (r"\s*Дякую за (ваше )?звернення[.!]?", ""), (r"\s*З повагою[^\n]*", "")]
+
+
+def polish(text):
+    """Last safety net: no leftover tag fragments or banned stock phrases reach the client."""
+    m = re.search(r"\[(BOOKING|MASTER|CANCEL|ДЛ)", text, re.I)
+    if m:
+        text = text[:m.start()]
+    for pat, repl in STOCK_PHRASES:
+        text = re.sub(pat, repl, text, flags=re.I)
+    text = re.sub(r"(Що саме вас цікавить\?)(\s*Що саме вас цікавить\?)+", r"\1", text)
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    text = re.sub(r"^[—–-]\s*", "", text)
+    # capital letter at the start of each sentence (after the replacements above)
+    return re.sub(r"(^|[.!?…]\s+)([a-zа-яіїєґ])", lambda m: m.group(1) + m.group(2).upper(), text)
 
 
 def profile_of(t):
@@ -785,8 +846,8 @@ def extract_booking(conv, pending_reply=""):
            "Якщо чогось немає — null.")
     data = {}
     try:
-        resp = client.messages.create(model=MODEL, max_tokens=200, messages=[{"role": "user", "content": ask}])
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        resp = client.messages.create(model=model_now(), max_tokens=MAX_OUT, messages=[{"role": "user", "content": ask}])
+        text = answer_text(resp, "extraction")
         m = re.search(r"\{.*\}", text, re.S)
         data = json.loads(m.group(0)) if m else {}
     except Exception as e:
@@ -1106,12 +1167,12 @@ def confirmation_text(conv, b=None):
     t, _ = split_conv(conv)
     known = f"Дані запису: {fmt_when(b)}, {b.get('service') or ''}, {b.get('name') or ''}.\n" if b else ""
     try:
-        resp = client.messages.create(model=MODEL, max_tokens=200, system=system_prompt(t), messages=[{
+        resp = client.messages.create(model=model_now(), max_tokens=MAX_OUT, system=system_prompt(t), messages=[{
             "role": "user",
             "content": f"Розмова з клієнтом:\n{transcript(conv)}\n\n{known}Майстер щойно ПІДТВЕРДИЛА цей запис. "
                        "Напиши клієнту одне коротке тепле повідомлення: запис підтверджено, назви послугу, день і "
                        "час, нагадай адресу. Лише текст повідомлення, без тегів."}])
-        text = "".join(x.text for x in resp.content if getattr(x, "type", "") == "text").strip()
+        text = answer_text(resp, "confirmation")
         text = text.replace(BOOKING_TAG, "").replace(HANDOFF_TAG, "").partition(NOTE_TAG)[0].strip()
         if text:
             return text
@@ -1830,7 +1891,8 @@ UA_MONTHS_GEN = ["січня", "лютого", "березня", "квітня",
                  "жовтня", "листопада", "грудня"]
 GREETING_RE = re.compile(r"^\W*(добр(ий|ого|ої)|привіт|вітаю|здрастуйте|hello|hi)\b", re.I)
 BANNED = ["записала вас", "запис підтверджено", "дякую за звернення", "чим можу допомогти", "з повагою", "[", "]",
-          "для майстра"]
+          "для майстра", "звучить добре", "звучить чудово", "дайте знати", "на даний момент", "згідно з",
+          "вибачаюсь", "слідуюч", "являєт", "на протязі", "самий кращ", "не соромтеся", "маєте гарний"]
 
 
 def selftest_scenarios():
@@ -1869,7 +1931,7 @@ def selftest_scenarios():
          "kind": "question"},
         {"id": "human", "title": "Просить живу людину", "turns": ["Можна поговорити з майстром особисто?"],
          "kind": "question"},
-        {"id": "bot", "title": "«Ти бот?»", "turns": ["Ти бот?"], "contains_any": ["помічни", "онлайн"]},
+        {"id": "bot", "title": "«Ти бот?»", "turns": ["Ти бот?"], "contains_any": ["помічни", "онлайн"], "not_contains": ["чим можу допомогти"]},
         {"id": "sister", "title": "Запис іншої людини", "turns": ["Хочу записати сестру на манікюр"],
          "contains_any": ["ім", "?"]},
         {"id": "voice", "title": "Голосове", "turns": ["[Клієнт надіслав голосове повідомлення — ти не можеш його прослухати]"],
@@ -1880,7 +1942,7 @@ def selftest_scenarios():
          "contains": ["350"]},
         {"id": "greet", "title": "Вітається лише раз", "turns": ["Привіт", "а педикюр скільки?"], "contains": ["750"]},
         {"id": "address", "title": "Адреса і графік", "turns": ["Де ви знаходитесь і до котрої працюєте?"],
-         "contains": ["Городоцька", "19"]},
+         "contains": ["Городоцьк", "19"]},
         {"id": "resched", "title": "Перенесення запису", "seed": (mon.isoformat(), "10:00"),
          "turns": ["Можна перенести мій запис на вівторок на 15:00?", "так"],
          "booking": {"date": tue.isoformat(), "time": "15:00"}},
@@ -1889,9 +1951,10 @@ def selftest_scenarios():
     ]
 
 
-def selftest_run():
+def selftest_run(model=None):
     kv_set("selftest_running", time.time())
-    report = {"started": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()), "model": MODEL, "results": []}
+    _last.model = model or MODEL
+    report = {"started": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()), "model": _last.model, "results": []}
     try:
         demo = tenant_get("demo")
         prof = profile_of(demo)
@@ -1914,11 +1977,16 @@ def selftest_run():
                 if booked and msg == "так":
                     break   # already passed on, no need for the confirming "так"
                 save(conv, "user", msg)
+                err_before = kv_get("last_claude_error")
+                _last.meta = None
                 clean, kind, _, note, details, warnings = think_checked(conv)
                 if clean and clean != FALLBACK:
                     save(conv, "assistant", clean)
+                err_now = kv_get("last_claude_error")
                 steps.append({"client": msg, "ai": clean, "kind": kind, "note": note, "details": details,
-                              "warnings": warnings})
+                              "warnings": warnings, "meta": getattr(_last, "meta", None),
+                              "error": err_now if err_now != err_before else None})
+                time.sleep(1.5)   # be gentle with the API rate limit
                 low = (clean or "").lower()
                 if not clean or clean == FALLBACK:
                     fails.append(f"крок {i + 1}: порожня/аварійна відповідь")
@@ -1974,7 +2042,10 @@ def selftest_page():
     k = esc(TEST_KEY)
     running = time.time() - float(kv_get("selftest_running", 0) or 0) < 900
     if request.args.get("run") and not running:
-        threading.Thread(target=selftest_run, daemon=True).start()
+        chosen = request.args.get("model") or MODEL
+        if not re.fullmatch(r"claude-[a-z0-9.-]+", chosen):
+            chosen = MODEL
+        threading.Thread(target=selftest_run, args=(chosen,), daemon=True).start()
         return redirect(f"/selftest?key={TEST_KEY}")
     rep = json.loads(kv_get("selftest_report") or "{}")
     res = rep.get("results", [])
@@ -1985,7 +2056,11 @@ def selftest_page():
     if running:
         head += f'<meta http-equiv="refresh" content="5"><p>⏳ Триває… {len(res)}/{total}</p>'
     else:
-        head += f'<p><a class="btn" href="/selftest?key={k}&run=1">▶ Запустити перевірку</a></p>'
+        head += (f'<p><a class="btn" href="/selftest?key={k}&run=1">▶ Запустити ({esc(MODEL)})</a></p>'
+                 f'<p class="muted">Порівняти з іншою моделлю: '
+                 f'<a href="/selftest?key={k}&run=1&model=claude-sonnet-5-5">Sonnet (краща українська, дорожче)</a> · '
+                 f'<a href="/selftest?key={k}&run=1&model=claude-haiku-5-5">Haiku (дешевше)</a>. '
+                 f'Щоб змінити модель для клієнтів — CLAUDE_MODEL на Render.</p>')
     if res:
         head += (f'<h2>{"✅" if ok == len(res) else "⚠️"} {ok}/{len(res)} сценаріїв пройдено</h2>'
                  f'<p class="muted">Початок: {esc(rep.get("started"))} · Кінець: {esc(rep.get("finished", "—"))}</p>')
@@ -1997,6 +2072,8 @@ def selftest_page():
             f'<div style="margin:6px 0"><b>Клієнт:</b> {esc(s_["client"])}<br><b>Помічник:</b> {esc(s_["ai"])}'
             + (f' <span class="muted">[{esc(s_["kind"])}]</span>' if s_.get("kind") else "")
             + (f'<br><span class="muted">заявка: {esc(json.dumps(s_["details"], ensure_ascii=False))}</span>' if s_.get("details") else "")
+            + (f'<br><span class="bad">помилка: {esc(s_["error"])}</span>' if s_.get("error") else "")
+            + (f'<br><span class="muted">тех.: {esc(json.dumps(s_["meta"]))}</span>' if s_.get("meta") and not r["ok"] else "")
             + "</div>" for s_ in r["steps"])
         fails = "".join(f"<li>{esc(f_)}</li>" for f_ in r["fails"])
         cards.append(f'<div class="card"><b>{"✅" if r["ok"] else "❌"} {esc(r["title"])}</b>'
