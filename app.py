@@ -19,6 +19,11 @@ Env vars (set on Render, never in code):
   TELEGRAM_BOT_TOKEN  optional  for handoff to the specialist
   TELEGRAM_CHAT_ID    optional  the specialist's chat id with your bot
   CLAUDE_MODEL        optional  default claude-haiku-5-5 (cheap); claude-sonnet-5-5 for smarter replies
+  ADMIN_TELEGRAM_CHAT_ID optional  where YOUR technical alerts go (default: TELEGRAM_CHAT_ID)
+
+The Instagram token renews itself every 5 days (it would otherwise die after
+60 days). The fresh token is kept in the database on the /data disk. If you
+ever paste a new IG_ACCESS_TOKEN on Render, the server switches to it.
 """
 
 import hashlib
@@ -27,6 +32,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 
 import requests
@@ -41,10 +47,13 @@ if missing:
 
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 TEST_KEY = os.environ["TEST_KEY"]
-IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
+IG_ENV_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+ADMIN_CHAT = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "") or TG_CHAT
+TOKEN_RENEW_EVERY = 5 * 86400   # renew the Instagram token every 5 days
+TOKEN_CHECK_EVERY = 6 * 3600    # look at it every 6 hours
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 GRAPH_URL = os.environ.get("GRAPH_URL", "https://graph.instagram.com/v21.0/me/messages")
 HISTORY_TURNS = 12
@@ -73,7 +82,19 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS messages (
         user_id TEXT, role TEXT, text TEXT, ts REAL)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS seen (mid TEXT PRIMARY KEY)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)""")
     return conn
+
+
+def kv_get(key, default=None):
+    with db() as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def kv_set(key, value):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", (key, str(value)))
 
 
 def already_handled(mid):
@@ -165,7 +186,15 @@ def ask_claude(user_id, text):
             model=MODEL, max_tokens=500, system=system_prompt(), messages=history(user_id))
         reply = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
     except Exception as e:
-        print(f"Claude error: {e}")
+        print(f"Claude error: {e}", flush=True)
+        err = str(e).lower()
+        if "credit balance" in err or "billing" in err:
+            alert_admin("💳 Закінчився баланс Anthropic — помічник не може відповідати. "
+                        "Поповніть: https://console.anthropic.com/settings/billing", "claude", every=3600)
+        elif "authentication" in err or "api key" in err or "401" in err:
+            alert_admin("🔑 Anthropic не приймає ключ. Перевірте ANTHROPIC_API_KEY на Render.", "claude", every=3600)
+        else:
+            alert_admin(f"⚠️ Помилка Claude: {str(e)[:300]}", "claude", every=3600)
         reply = HANDOFF_TAG + " " + FALLBACK
     if not reply:
         reply = HANDOFF_TAG + " " + FALLBACK
@@ -191,16 +220,101 @@ def notify_master(user_id, client_text, ai_reply):
             print(f"Telegram error: {e}")
 
 
+def alert_admin(text, key, every=86400):
+    """Technical problems go to YOU (not the specialist), at most once per `every` seconds."""
+    print("ALERT:", text, flush=True)
+    last = float(kv_get(f"alert_{key}", 0))
+    if time.time() - last < every or not (TG_TOKEN and ADMIN_CHAT):
+        return
+    kv_set(f"alert_{key}", time.time())
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": ADMIN_CHAT, "text": "[Технічне] " + text}, timeout=10)
+    except requests.RequestException as e:
+        print(f"Telegram error: {e}")
+
+
+# ------------------------------------------------- Instagram token, renews itself
+def ig_token():
+    """The current Instagram token. Starts from IG_ACCESS_TOKEN on Render, then the
+    renewed copies saved in the database are used. Pasting a new token on Render wins."""
+    if IG_ENV_TOKEN:
+        env_hash = hashlib.sha256(IG_ENV_TOKEN.encode()).hexdigest()
+        if kv_get("ig_env_hash") != env_hash:      # first start, or you pasted a new token
+            now = time.time()
+            kv_set("ig_env_hash", env_hash)
+            kv_set("ig_token", IG_ENV_TOKEN)
+            kv_set("ig_renewed_at", now)
+            kv_set("ig_expires_at", now + 60 * 86400)
+            kv_set("ig_last_error", "")
+    return kv_get("ig_token") or IG_ENV_TOKEN
+
+
+def renew_token(force=False):
+    token = ig_token()
+    if not token:
+        return "no token"
+    age = time.time() - float(kv_get("ig_renewed_at", 0))
+    if not force and age < TOKEN_RENEW_EVERY:
+        return "not due yet"
+    ok, data = False, {}
+    try:
+        r = requests.get("https://graph.instagram.com/refresh_access_token",
+                         params={"grant_type": "ig_refresh_token", "access_token": token}, timeout=20)
+        data = r.json()
+        ok = r.ok and bool(data.get("access_token"))
+    except (requests.RequestException, ValueError) as e:
+        data = {"error": str(e)}
+    now = time.time()
+    if ok:
+        kv_set("ig_token", data["access_token"])
+        kv_set("ig_renewed_at", now)
+        kv_set("ig_expires_at", now + int(data.get("expires_in") or 60 * 86400))
+        kv_set("ig_last_error", "")
+        print("Instagram token renewed", flush=True)
+        return "renewed"
+    err = json.dumps(data.get("error", data), ensure_ascii=False)[:300]
+    kv_set("ig_last_error", time.strftime("%Y-%m-%d %H:%M UTC ", time.gmtime()) + err)
+    days_left = (float(kv_get("ig_expires_at", 0)) - now) / 86400
+    alert_admin(f"⚠️ Не вдалося оновити токен Instagram (лишилось ~{days_left:.0f} дн.). "
+                f"Сервер повторить сам через 6 год. Помилка: {err}", "ig_token")
+    return "failed"
+
+
+def token_status():
+    exp = float(kv_get("ig_expires_at", 0))
+    renewed = float(kv_get("ig_renewed_at", 0))
+    return {"has_token": bool(ig_token()),
+            "last_renewed": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(renewed)) if renewed else None,
+            "days_left": round((exp - time.time()) / 86400, 1) if exp else None,
+            "last_error": kv_get("ig_last_error", "") or None}
+
+
+def token_keeper():
+    time.sleep(60)  # let the server start first
+    while True:
+        try:
+            renew_token()
+        except Exception as e:  # never let this thread die
+            print(f"Token keeper error: {e}", flush=True)
+        time.sleep(TOKEN_CHECK_EVERY)
+
+
 def send_instagram(recipient_id, text):
-    if not IG_ACCESS_TOKEN:
+    token = ig_token()
+    if not token:
         print("No IG_ACCESS_TOKEN set; not sending:", text)
         return False
     r = requests.post(GRAPH_URL,
-                      headers={"Authorization": f"Bearer {IG_ACCESS_TOKEN}"},
+                      headers={"Authorization": f"Bearer {token}"},
                       json={"recipient": {"id": recipient_id}, "message": {"text": text}},
                       timeout=15)
     if not r.ok:
-        print(f"Instagram send failed {r.status_code}: {r.text[:300]}")
+        print(f"Instagram send failed {r.status_code}: {r.text[:300]}", flush=True)
+        if '"code":190' in r.text.replace(" ", ""):
+            alert_admin("🔑 Токен Instagram недійсний — відповіді не надсилаються. Згенеруйте новий у Meta "
+                        "(API setup with Instagram login → Generate token) і вставте в IG_ACCESS_TOKEN на Render.",
+                        "ig_dead")
     return r.ok
 
 
@@ -216,7 +330,7 @@ def signature_ok(raw_body):
 @app.route("/")
 def health():
     return jsonify(status="running", model=MODEL, specialist=SPECIALIST.get("brand"),
-                   instagram_ready=bool(IG_ACCESS_TOKEN), telegram_ready=bool(TG_TOKEN and TG_CHAT))
+                   instagram_ready=bool(ig_token()), telegram_ready=bool(TG_TOKEN and TG_CHAT))
 
 
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
@@ -278,9 +392,10 @@ def subscribe():
     Meta sends NO DMs to the server until this is done (once per account)."""
     if request.args.get("key") != TEST_KEY:
         abort(403)
-    if not IG_ACCESS_TOKEN:
+    token = ig_token()
+    if not token:
         return jsonify(error="IG_ACCESS_TOKEN is not set on Render"), 400
-    auth = {"access_token": IG_ACCESS_TOKEN}
+    auth = {"access_token": token}
     me = requests.get(f"{GRAPH_BASE}/me", params={**auth, "fields": "user_id,username"}, timeout=15)
     if not me.ok:
         return jsonify(step="read account", status=me.status_code, meta_says=me.json()), 400
@@ -298,7 +413,19 @@ def subscribe():
 def debug():
     if request.args.get("key") != TEST_KEY:
         abort(403)
-    return jsonify(instagram_ready=bool(IG_ACCESS_TOKEN), recent_webhook_visits=RECENT[::-1])
+    return jsonify(instagram_token=token_status(), recent_webhook_visits=RECENT[::-1])
+
+
+@app.route("/renew-token")
+def renew_now():
+    """Renew the Instagram token right now (normally happens by itself)."""
+    if request.args.get("key") != TEST_KEY:
+        abort(403)
+    result = renew_token(force=True)
+    return jsonify(result=result, instagram_token=token_status())
+
+
+threading.Thread(target=token_keeper, daemon=True).start()
 
 
 @app.route("/instagram/webhook", methods=["GET"])
