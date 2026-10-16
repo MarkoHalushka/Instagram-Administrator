@@ -389,6 +389,7 @@ def system_prompt(t):
   Завжди відповідай хоча б одним реченням.
 - Не повторюй усі деталі запису щоразу; підсумуй один раз, коли все зібрано.
 - Не пропонуй додаткові послуги, якщо про них не питали.
+- Прощайся один раз, коротко. Після «гарного дня»/«до зустрічі» не став нових питань.
 - Твоя відповідь — це повідомлення, яке клієнт побачить у Direct. Звертайся тільки до клієнта, на «ви».
   Ніколи не пиши в ній нотаток, підсумків чи інструкцій для майстра і не говори про клієнта в третій особі.
 - Не вгадуй стать клієнта за іменем; якщо невідомо — пиши нейтрально.
@@ -408,7 +409,9 @@ def system_prompt(t):
 - «самий кращий» → «найкращий»; «вірно» → «правильно»; «заказати» → «замовити»; «пара днів» → «кілька днів»
 - «зручно для вас» → «вам зручно»; «бажаєте…?» → «хочете…?» або просто питання
 - «майстер зв'яжеться з вами найближчим часом» → «майстер скоро напише вам»
-Звертайся у кличному відмінку: «Марку», «Олено», «Ірино», «Анно» (а не «Марко!» як звертання — хоча якщо не впевнена у формі, просто без імені).
+ІМЕНА: не звертайся до клієнта на ім'я — пиши без імені. Якщо ім'я справді потрібне (наприклад, у підсумку запису),
+пиши його лише в називному відмінку, точно як написав клієнт («Марія», «Марко»). Ніколи не став ім'я в кличний відмінок
+і не роби зменшувальних форм («Марійко», «Марічко», «Марку», «Оленко» — не можна).
 Приклади природних фраз: «Супер, тоді понеділок, 19.10 о 12:00 🙂», «Домовились!», «Так, звісно», «Без проблем»,
 «Підкажіть, будь ласка…», «Гляньте, будь ласка…», «Скиньте фото — майстер подивиться».
 
@@ -424,7 +427,9 @@ def system_prompt(t):
 Клієнт: «в понеділок о 12»
 Ти: «Супер, понеділок о 12:00 🙂 Підкажіть, будь ласка, ваше ім'я і номер телефону»
 Клієнт: «Марко, 0991234567»
-Ти: «{BOOKING_TAG} Дякую, Марку! Передала заявку на понеділок о 12:00, майстер скоро підтвердить 🙌»
+Ти: «{BOOKING_TAG} Дякую! Передала заявку на понеділок о 12:00, майстер скоро підтвердить 🙌»
+Клієнт: «дякую, гарного дня!»
+(ти НІЧОГО не відповідаєш — розмова завершена; система сама не надішле відповідь)
 Клієнт: «а можна перенести на вівторок на 15?»
 Ти: «Так, звісно. Передала майстру заявку на перенесення на вівторок о 15:00 — вона підтвердить.»  (з тегом {BOOKING_TAG} і {NOTE_TAG} перенесення)
 (Ціни в прикладах — лише для тону. Справжні ціни — ТІЛЬКИ з даних майстра нижче.)
@@ -573,7 +578,8 @@ def polish(text):
 EDITOR_PROMPT = """Ти — редакторка повідомлень салону краси в Instagram Direct.
 Перепиши повідомлення природною розмовною українською, як пише жива адміністраторка-українка.
 Виправ: кальки з англійської й російської («звучить добре» → «чудово», «дайте знати» → «напишіть»), русизми,
-граматику, відмінки, кличний відмінок імен, неприродний порядок слів, канцелярит.
+граматику, відмінки, неприродний порядок слів, канцелярит.
+Не додавай звертання на ім'я. Якщо ім'я вже є — залиш його в називному відмінку (без «Марійко», «Марку» тощо).
 ЗБЕРЕЖИ ПОВНІСТЮ зміст: усі числа, ціни, дати, час, імена, адресу, питання і прохання. Нічого не додавай і не прибирай,
 не додавай вітання, якщо його не було. Довжина приблизно та сама. Емодзі залиш як є.
 Якщо текст уже звучить природно — поверни його без змін. Відповідай ЛИШЕ готовим текстом повідомлення."""
@@ -734,7 +740,7 @@ def client_facts(conv):
         known = conn.execute("""SELECT name, phone FROM bookings WHERE conv=? AND (name IS NOT NULL OR phone IS NOT NULL)
                                 ORDER BY created DESC LIMIT 1""", (conv,)).fetchone()
     lines = []
-    if last and (not last["date"] or last["date"] >= today_kyiv().isoformat()):
+    if last and not booking_over(dict(last)) and (not last["date"] or last["date"] >= today_kyiv().isoformat()):
         st = "підтверджений" if last["status"] == "confirmed" else "чекає підтвердження майстра"
         lines.append(f"У цього клієнта вже є запис: {fmt_when(dict(last))}, {last['service'] or ''} ({st}). "
                      "Згадуй про нього лише якщо це доречно (клієнт питає про свій запис, хоче перенести чи скасувати).")
@@ -803,7 +809,7 @@ def answer_later(conv, my_id, received_at, text=""):
         def superseded():
             return kv_get(f"latest_{conv}") != my_id
 
-        if is_reaction_only(conv):   # "👍", "❤️" after we already talked: a person wouldn't answer
+        if is_reaction_only(conv):   # "дякую, і вам", "👍" after we already talked: a person wouldn't answer
             return
         clean, kind, client_text, note, details, warnings = think_checked(conv)
         if clean == FALLBACK and not superseded():   # one more try after a pause before giving up
@@ -837,17 +843,35 @@ def answer_later(conv, my_id, received_at, text=""):
         print(f"Reply error for {conv}: {e}", flush=True)
 
 
+CLOSING_WORDS = set("""дякую дякуємо дяк дякі спасибі спасибо пасиб дуже велике і й та а вам тобі вас також теж взаємно
+навзаєм навзаєм гарного гарний гарної хорошого хорошої чудового чудової доброго доброї приємного дня вечора вихідних
+тижня ночі до зустрічі побачення бувайте бувай па пака ок окей окі ага угу добре гаразд супер клас чудово прекрасно
+домовились домовилися чекаю буду прийду прийдемо обовязково обов'язково обовʼязково все зрозуміло зрозуміла зрозумів
+ясно ясненько дякувати thanks thank you thx ok okay bye see""".split())
+
+
+def is_closing(text):
+    """Just thanks / goodbye / ok / emoji — nothing that needs an answer."""
+    t = (text or "").lower()
+    if "?" in t or re.search(r"\d", t) or "[" in t:
+        return False
+    words = re.findall(r"[a-zа-яіїєґ'ʼ]+", t)
+    return len(words) <= 10 and all(w in CLOSING_WORDS for w in words)
+
+
 def is_reaction_only(conv):
-    """True if everything the client wrote since our last reply is just emoji/punctuation."""
+    """True if, after we already answered, the client only thanked / said goodbye / sent emoji.
+    A real administrator wouldn't reply to that (and replying causes "thanks — you too" loops)."""
     rows = session_rows(conv)
-    if not any(r["role"] == "assistant" for r in rows):
+    ours = [r["text"] for r in rows if r["role"] == "assistant"]
+    if not ours or "?" in ours[-1]:   # if we asked something, "ок"/"добре" IS the answer — reply
         return False
     tail = []
     for r in reversed(rows):
         if r["role"] == "assistant":
             break
         tail.append(r["text"])
-    return bool(tail) and not any(re.search(r"[^\W_]", x) for x in tail)
+    return bool(tail) and all(is_closing(x) for x in tail)
 
 
 def manual_reply_check(conv, mid, text, arrived=None):
@@ -937,12 +961,30 @@ def extract_booking(conv, pending_reply=""):
     return {"name": val("name", 80), "phone": val("phone", 40), "service": val("service", 120), "date": d, "time": tm}
 
 
+def booking_over(b):
+    """True once the appointment has ended (start + service duration, or 1 hour) in Kyiv time."""
+    if not b.get("date"):
+        return False
+    d = date.fromisoformat(b["date"])
+    now = datetime.now(KYIV)
+    if d != now.date():
+        return d < now.date()
+    if not b.get("time"):
+        return False
+    t = tenant_get(b["tenant"]) if b.get("tenant") else None
+    end = to_min(b["time"]) + (service_minutes(profile_of(t), b.get("service")) or 60)
+    return now.hour * 60 + now.minute >= end
+
+
 def upcoming_booking(conv, statuses=("confirmed",)):
     with db() as conn:
-        row = conn.execute(f"""SELECT * FROM bookings WHERE conv=? AND status IN ({','.join('?' * len(statuses))})
-                               AND (date IS NULL OR date>=?) ORDER BY date, time LIMIT 1""",
-                           (conv, *statuses, today_kyiv().isoformat())).fetchone()
-    return dict(row) if row else None
+        rows = conn.execute(f"""SELECT * FROM bookings WHERE conv=? AND status IN ({','.join('?' * len(statuses))})
+                               AND (date IS NULL OR date>=?) ORDER BY date, time""",
+                            (conv, *statuses, today_kyiv().isoformat())).fetchall()
+    for r in rows:
+        if not booking_over(dict(r)):
+            return dict(r)
+    return None
 
 
 def booking_create(conv, details, reschedule=False):
@@ -1027,7 +1069,8 @@ def send_booking_list(t, chat, which):
         title, start, end = "📋 Усі майбутні записи", today, today + timedelta(days=365)
     else:
         title, start, end = "📅 Найближчі 7 днів", today, today + timedelta(days=6)
-    items = bookings_between(t["id"], start, end, undated=(which in ("week", "all")))
+    items = [b for b in bookings_between(t["id"], start, end, undated=(which in ("week", "all")))
+             if not booking_over(b)]   # finished ones live in 🕘 Історія
     head = title + (f" — {t['name']}" if len(tenants_by_chat(chat)) > 1 else "")
     if not items:
         tg_send(chat, head + "\n\nЗаписів немає.", markup=main_keyboard())
@@ -1054,8 +1097,9 @@ def send_history(t, chat, days=30):
     with db() as conn:
         rows = [dict(r) for r in conn.execute(
             """SELECT * FROM bookings WHERE tenant=? AND status IN ('confirmed','cancelled','pending')
-               AND date>=? AND date<? ORDER BY date DESC, time DESC""",
+               AND date>=? AND date<=? ORDER BY date DESC, time DESC""",
             (t["id"], start.isoformat(), today.isoformat())).fetchall()]
+    rows = [r for r in rows if r["date"] < today.isoformat() or booking_over(r)]
     head = f"🕘 Історія за {days} днів" + (f" — {t['name']}" if len(tenants_by_chat(chat)) > 1 else "")
     if not rows:
         tg_send(chat, head + "\n\nМинулих записів ще немає.", markup=main_keyboard())
@@ -1091,6 +1135,8 @@ def digest_loop():
                         "SELECT * FROM bookings WHERE status='pending' AND created < ? AND (date IS NULL OR date >= ?)",
                         (time.time() - 7200, now.date().isoformat())).fetchall()]
                 for b in waiting:
+                    if booking_over(b):
+                        continue
                     t = tenant_get(b["tenant"])
                     if t and t.get("tg_chat") and not kv_get(f"remind_{b['id']}"):
                         kv_set(f"remind_{b['id']}", 1)
@@ -1272,8 +1318,8 @@ def on_button(chat, action, ref, message):
         if action == "bok":
             if b["status"] != "pending":
                 return STALE.get(b["status"], "Вже оброблено")
-            if b.get("date") and b["date"] < today_kyiv().isoformat():
-                return "Дата цієї заявки вже минула"
+            if (b.get("date") and b["date"] < today_kyiv().isoformat()) or booking_over(b):
+                return "Час цієї заявки вже минув"
             if not booking_claim(b["id"], ("pending",), "confirming"):
                 return "Вже оброблено"
             text = confirmation_text(conv, b)
@@ -1851,6 +1897,8 @@ def telegram_setup():
     need_key()
     if not TG_TOKEN:
         return jsonify(error="TELEGRAM_BOT_TOKEN is not set on Render"), 400
+    kv_set("bot_username", "")   # re-read the bot's @username (in case you switched to a new bot)
+    bot_username()
     result = tg("setWebhook", url=base_url() + "/telegram/webhook", secret_token=TG_SECRET,
                 allowed_updates=["message", "callback_query"], drop_pending_updates=True)
     tg("setMyCommands", commands=[{"command": "today", "description": "Записи на сьогодні"},
@@ -1958,7 +2006,7 @@ GREETING_RE = re.compile(r"^\W*(добр(ий|ого|ої)|привіт|віта
 BANNED = ["записала вас", "запис підтверджено", "дякую за звернення", "чим можу допомогти", "з повагою", "[", "]",
           "для майстра", "звучить добре", "звучить чудово", "дайте знати", "на даний момент", "згідно з",
           "вибачаюсь", "слідуюч", "являєт", "на протязі", "самий кращ", "не соромтеся", "маєте гарний",
-          "у межах робочого", "у нас вільно", "час вільний", "оля на зв", "оля з olya"]
+          "у межах робочого", "у нас вільно", "час вільний", "оля на зв", "оля з olya", "марку", "марійк"]
 
 
 def selftest_scenarios():
@@ -2008,6 +2056,11 @@ def selftest_scenarios():
          "turns": ["Сколько стоит маникюр без покрытия?"], "contains": ["350"],
          "not_contains": ["стоит", "маникюр", "удобно", "покрыти"]},
         {"id": "greet", "title": "Вітається лише раз", "turns": ["Привіт", "а педикюр скільки?"], "contains": ["750"]},
+        {"id": "bye", "title": "Прощання без зациклення",
+         "turns": ["Скільки манікюр з покриттям?", "Дякую, все зрозуміло", "і вам гарного дня!"],
+         "expect_silent_last": True},
+        {"id": "name", "title": "Ім'я без «Марійко»", "turns": ["Хочу на манікюр з покриттям у вівторок о 11, Марія, 0671234567"],
+         "not_contains": ["марійк", "марічк", "маріє"]},
         {"id": "address", "title": "Адреса і графік", "turns": ["Де ви знаходитесь і до котрої працюєте?"],
          "contains": ["Городоцьк", "19"]},
         {"id": "resched", "title": "Перенесення запису", "seed": (mon.isoformat(), "10:00"),
@@ -2044,6 +2097,9 @@ def selftest_run(model=None):
                 if booked and msg == "так":
                     break   # already passed on, no need for the confirming "так"
                 save(conv, "user", msg)
+                if is_reaction_only(conv):   # the real server stays silent here
+                    steps.append({"client": msg, "ai": "(мовчить — розмова завершена)", "kind": None, "silent": True})
+                    continue
                 err_before = kv_get("last_claude_error")
                 _last.meta = None
                 clean, kind, _, note, details, warnings = think_checked(conv)
@@ -2055,6 +2111,8 @@ def selftest_run(model=None):
                               "error": err_now if err_now != err_before else None})
                 time.sleep(1.5)   # be gentle with the API rate limit
                 low = (clean or "").lower()
+                if sc.get("expect_silent_last") and i == len(sc["turns"]) - 1:
+                    fails.append("відповіла на прощання — мала мовчати")
                 if not clean or clean == FALLBACK:
                     fails.append(f"крок {i + 1}: порожня/аварійна відповідь")
                 for bad in BANNED:
