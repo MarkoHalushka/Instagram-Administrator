@@ -1765,8 +1765,8 @@ def connect_page(code):
     done = f'<p class="ok">✓ Instagram @{esc(t.get("ig_username"))} уже підключено.</p>' if t.get("token") else ""
     body = f"""<h1>Онлайн-адміністраторка для {esc(t['name'])}</h1>{done}
     <div class="card"><b>Крок 1.</b> Прийміть запрошення в Instagram (якщо вам його надіслали):<br>
-    Instagram → Налаштування → <i>Дозволи для вебсайтів</i> (Website permissions) → <i>Програми та вебсайти</i> →
-    <i>Запрошення тестувальників</i> → Прийняти.</div>
+    відкрийте в браузері <a href="https://www.instagram.com/accounts/manage_access/">instagram.com/accounts/manage_access</a>
+    (<i>Додатки й сайти</i>) → вкладка <i>Запрошення тестувальників</i> → «Virtual Assistant-IG» → <b>Прийняти</b>.</div>
     <div class="card"><b>Крок 2.</b> Увійдіть в Instagram і дозвольте доступ до повідомлень.
     Пароль вводиться лише на сайті Instagram — ми його не бачимо.<p><a class="btn" href="{esc(auth)}">Підключити Instagram</a></p></div>
     <p class="muted">Помічник відповідає лише на повідомлення в Direct і не публікує нічого від вашого імені.
