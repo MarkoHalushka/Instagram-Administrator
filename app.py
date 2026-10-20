@@ -810,6 +810,10 @@ def answer_later(conv, my_id, received_at, text=""):
             return kv_get(f"latest_{conv}") != my_id
 
         if is_reaction_only(conv):   # "дякую, і вам", "👍" after we already talked: a person wouldn't answer
+            # ...but she would like the message, so the client isn't left on "seen"
+            time.sleep(min(MAX_DELAY, random.uniform(2, 4)))
+            if not superseded() and not is_paused(conv) and not re.fullmatch(r"[\d.]+", my_id):
+                send_reaction(t, igsid, my_id)
             return
         clean, kind, client_text, note, details, warnings = think_checked(conv)
         if clean == FALLBACK and not superseded():   # one more try after a pause before giving up
@@ -1568,6 +1572,22 @@ def sender_action(t, igsid, action):
                       json={"recipient": {"id": igsid}, "sender_action": action}, timeout=10)
     except requests.RequestException:
         pass
+
+
+def send_reaction(t, igsid, mid, reaction="love"):
+    """Puts a ❤️ on the client's message (Instagram supports only "love")."""
+    if not t or not t.get("token") or not mid:
+        return False
+    try:
+        r = requests.post(GRAPH_URL, headers={"Authorization": f"Bearer {t['token']}"},
+                          json={"recipient": {"id": igsid}, "sender_action": "react",
+                                "payload": {"message_id": mid, "reaction": reaction}}, timeout=10)
+    except requests.RequestException as e:
+        print(f"Instagram reaction error: {e}", flush=True)
+        return False
+    if not r.ok:
+        print(f"Instagram reaction failed {r.status_code}: {r.text[:200]}", flush=True)
+    return r.ok
 
 
 def split_message(text, limit=900):
