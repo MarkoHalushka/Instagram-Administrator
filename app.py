@@ -259,6 +259,30 @@ def tenants_by_chat(chat):
                                                  (str(chat),)).fetchall()]
 
 
+def tenant_delete(tid):
+    """Remove a specialist/clinic with everything stored for it: chats, bookings, pauses.
+    Best effort: also tells Instagram to stop sending this account's messages to us."""
+    t = tenant_get(tid)
+    if not t:
+        return False
+    if t.get("token"):
+        try:
+            requests.delete(f"{GRAPH_BASE}/{t.get('ig_user_id') or 'me'}/subscribed_apps",
+                            params={"access_token": t["token"]}, timeout=10)
+        except requests.RequestException:
+            pass   # deleted anyway: messages from an unknown account are ignored
+    prefix = f"{tid}:"
+    with db() as conn:
+        bids = [r[0] for r in conn.execute("SELECT id FROM bookings WHERE tenant=?", (tid,)).fetchall()]
+        for b in bids:
+            conn.execute("DELETE FROM kv WHERE key IN (?, ?)", (f"remind_{b}", f"bprev_{b}"))
+        conn.execute("DELETE FROM bookings WHERE tenant=?", (tid,))
+        conn.execute("DELETE FROM messages WHERE substr(user_id, 1, ?) = ?", (len(prefix), prefix))
+        conn.execute("DELETE FROM kv WHERE instr(key, ?) > 0", ("_" + prefix,))
+        conn.execute("DELETE FROM tenants WHERE id=?", (tid,))
+    return True
+
+
 def tenants_all():
     with db() as conn:
         return [_tenant(r) for r in conn.execute("SELECT * FROM tenants ORDER BY created").fetchall()]
@@ -388,6 +412,10 @@ NICHE_TEXT = {   # short texts the server writes itself (not the AI)
                "question": "Уточню це в клініці і відповім вам.",
                "icon": "🦷", "place": "стоматологічної клініки", "staff": "клініки"},
 }
+
+
+def tg_help(t):
+    return TG_HELP.replace("онлайн-адміністраторки", "онлайн-адміністратора") if niche_of(t) == "dental" else TG_HELP
 
 
 def niche_text(t, key):
@@ -543,7 +571,7 @@ def system_prompt_dental(t):
     faq = "\n".join(f"- {x.get('q')} -> {x.get('a')}" for x in s.get("faq", []))
     brand = s.get("brand", "")
     return f"""Ти — адміністраторка стоматологічної клініки {brand} ({s.get('city', '')}) і відповідаєш пацієнтам в Instagram Direct.
-Ти не лікар і не ставиш діагнозів. Ти жінка: про себе — в жіночому роді («передала», «уточню»).
+Ти не лікар і не ставиш діагнозів. Ти жінка: про себе завжди говориш у жіночому роді («передала», «уточнила», «записала заявку»).
 
 СТИЛЬ (дуже важливо): стримано, професійно, точно — як адміністратор хорошої медичної клініки. {lang_rule}
 - На «ви». Відповіді короткі: 1–2 речення, максимум 3. Лише факти з даних клініки.
@@ -562,7 +590,7 @@ def system_prompt_dental(t):
 
 Приклади тону:
 Пацієнт: «Скільки коштує чистка?» → «Добрий день. Професійна гігієна — 1 900 грн, триває близько години. На який день вас записати?»
-Пацієнт: «Болить зуб, можна сьогодні?» → «Розумію. Спробуємо прийняти вас сьогодні. Напишіть, будь ласка, ім'я, номер телефону і з якого часу вам зручно.»
+Пацієнт: «Болить зуб, можна сьогодні?» → «Спробуємо прийняти вас сьогодні. Напишіть, будь ласка, ім'я, номер телефону і з якого часу вам зручно.»
 Пацієнт: «Скільки буде коштувати лікування зуба?» → «Точну вартість лікар назве після огляду: залежить від того, що з зубом. Консультація — 400 грн. Записати вас на огляд?»
 Пацієнт: «А що таке ОПТГ?» → «Це панорамний рентген-знімок усіх зубів одразу. У нас він коштує 450 грн.»
 Приклад цілої розмови:
@@ -604,7 +632,8 @@ def system_prompt_dental(t):
    огляду/знімка» — і пропонуй консультацію з її ціною.
 3. МЕДИЧНЕ: не став діагнозів, не пояснюй причин болю, не радь ліків, антибіотиків, полоскань, доз знеболювального, не оцінюй фото чи знімки.
    Не обіцяй результату лікування і не кажи «нічого страшного».
-   - Біль, випала пломба, відколовся зуб, кровоточать ясна → коротко поспівчувай одним словом («Розумію.») і запропонуй найближчий візит;
+   - Біль, випала пломба, відколовся зуб, кровоточать ясна → одразу запропонуй найближчий візит, без співчутливих фраз
+     («Розумію», «Мені шкода», «Співчуваю» — не пиши);
      у {NOTE_TAG} напиши «гострий біль» / що саме турбує.
    - Набряк обличчя, що збільшується, висока температура, важко ковтати чи дихати, кровотеча не зупиняється, травма щелепи —
      це невідкладно: одразу скажи телефонувати в клініку ({s.get('phone', '')}), а вночі чи у вихідні — 103. Тег {HANDOFF_TAG}.
@@ -1595,7 +1624,7 @@ def handle_telegram(update):
             t = tenant_find("tg_code", code)
             if t:
                 tenant_update(t["id"], tg_chat=chat)
-                tg_send(chat, f"✅ Підключено до «{t['name']}».\n\n" + TG_HELP, markup=main_keyboard())
+                tg_send(chat, f"✅ Підключено до «{t['name']}».\n\n" + tg_help(t), markup=main_keyboard())
                 alert_admin(f"✅ {t['name']} підключила Telegram", f"tglink_{t['id']}", every=60)
                 return
         mine = tenants_by_chat(chat)
@@ -1638,7 +1667,7 @@ def handle_telegram(update):
             else:
                 tg_send(chat, WINDOW_HINT, conv)
         elif text.startswith("/"):
-            tg_send(chat, TG_HELP, markup=main_keyboard())
+            tg_send(chat, tg_help(mine[0]) if mine else TG_HELP, markup=main_keyboard())
         elif text:
             tg_send(chat, "Щоб написати клієнту, відповідайте (свайп вліво) на повідомлення про нього "
                           "або натисніть ✍️ Відповісти.", markup=main_keyboard())
@@ -1884,7 +1913,7 @@ def admin():
             n = conn.execute("SELECT COUNT(*) FROM bookings WHERE tenant=? AND status='confirmed'", (t["id"],)).fetchone()[0]
         rows.append(f"""<div class="card"><b>{NICHE_TEXT[niche_of(t)]['icon']} {esc(t['name'])}</b> {'' if t.get('active') else '<span class="bad">(вимкнено)</span>'}<br>
         Instagram: {ig} &nbsp; Telegram: {tgs} &nbsp; токен: {ts['days_left'] or '—'} дн. &nbsp; записів: {n}<br>
-        <a href="/admin/t/{esc(t['id'])}?key={k}">Відкрити →</a></div>""")
+        <a href="/admin/t/{esc(t['id'])}?key={k}">Відкрити →</a>{delete_form(t, small=True)}</div>""")
     body = f"""<h1>Мої майстри</h1>{''.join(rows) or '<p class="muted">Поки нікого.</p>'}
     <h2>Новий майстер</h2><form method="post" action="/admin/new" class="card">
     <input type="hidden" name="key" value="{k}"><input name="name" placeholder="Напр.: Оксана Nails / Smile Dent" required>
@@ -1940,8 +1969,40 @@ def admin_tenant(tid):
     <p><textarea name="profile" rows="28">{esc(prof_text)}</textarea></p>
     <label><input type="checkbox" name="active" value="1" style="width:auto" {'checked' if t.get('active') else ''}> Помічник увімкнений</label>
     <p><button class="btn">Зберегти</button></p></form>
-    <p class="muted">Якщо повідомлення не доходять: <a href="/subscribe?key={k}&tenant={esc(tid)}">перепідписати Instagram</a></p>"""
+    <p class="muted">Якщо повідомлення не доходять: <a href="/subscribe?key={k}&tenant={esc(tid)}">перепідписати Instagram</a></p>
+    <div class="card"><b>Видалити</b> — для тестових акаунтів і тих, хто більше не користується.
+    Зникнуть дані, переписки й записи; помічник перестане відповідати в цьому Instagram.{delete_form(t)}</div>"""
     return page(t["name"], body)
+
+
+PROTECTED_TENANTS = ("selftest",)
+
+
+def delete_form(t, small=False):
+    if t["id"] in PROTECTED_TENANTS:
+        return ""
+    if t["id"] == "demo" and IG_ENV_TOKEN:
+        return ('' if small else '<p class="muted">Демо привʼязане до IG_ACCESS_TOKEN на Render і зʼявиться знову '
+                'після перезапуску. Щоб вимкнути його, зніміть галочку «Помічник увімкнений».</p>')
+    style = "background:#dc2626" + (";padding:6px 12px;font-size:14px" if small else "")
+    return (f'<form method="post" action="/admin/t/{esc(t["id"])}/delete" style="margin-top:10px" '
+            f'onsubmit="return confirm(\'Видалити назавжди? Це не можна скасувати.\')">'
+            f'<input type="hidden" name="key" value="{esc(TEST_KEY)}">'
+            f'<button class="btn" style="{style}">🗑 Видалити</button></form>')
+
+
+@app.route("/admin/t/<tid>/delete", methods=["POST"])
+def admin_delete(tid):
+    need_key()
+    t = tenant_get(tid)
+    if not t:
+        abort(404)
+    if tid in PROTECTED_TENANTS or (tid == "demo" and IG_ENV_TOKEN):
+        return page("Не можна", '<h1>Цей акаунт не можна видалити</h1>'
+                                f'<p><a href="/admin?key={esc(TEST_KEY)}">← назад</a></p>'), 400
+    tenant_delete(tid)
+    print(f"Deleted tenant {tid} ({t['name']})", flush=True)
+    return redirect(f"/admin?key={TEST_KEY}")
 
 
 @app.route("/connect/<code>")
@@ -2104,7 +2165,7 @@ def telegram_setup():
     if result.get("ok"):
         for t in tenants_all():
             if t.get("tg_chat"):
-                tg_send(t["tg_chat"], TG_HELP, markup=main_keyboard())
+                tg_send(t["tg_chat"], tg_help(t), markup=main_keyboard())
     return jsonify(telegram_says=result, webhook_url=info.get("url"), last_error=info.get("last_error_message"))
 
 
@@ -2202,7 +2263,7 @@ BANNED = ["записала вас", "запис підтверджено", "д�
           "у межах робочого", "у нас вільно", "час вільний", "оля на зв", "оля з olya", "марку", "марійк"]
 
 
-DENTAL_BANNED = ["супер", "чудово", "клас!", "майстр", "антибіот", "ібупрофен", "нурофен", "кетанов", "парацетамол", " мг"]
+DENTAL_BANNED = ["супер", "чудово", "клас!", "майстр", "передав ", "розумію", "антибіот", "ібупрофен", "нурофен", "кетанов", "парацетамол", " мг"]
 
 
 def selftest_scenarios(niche="nails"):
