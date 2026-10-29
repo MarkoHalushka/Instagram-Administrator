@@ -13,7 +13,7 @@ sends booking requests to her Telegram with buttons, and keeps her appointment l
 | `glossary_dental.json` | dental terms and slang (пломба, вісімка, ОПТГ, елайнери…) |
 | `requirements.txt` | Python packages |
 | `test_chat.py` | optional: chat with the AI from your computer |
-| `test_suite.py` | optional: 163 offline tests of the server logic (`python test_suite.py`) |
+| `test_suite.py` | optional: 167 offline tests of the server logic (`python test_suite.py`) |
 
 ## Render → Environment
 Required: `ANTHROPIC_API_KEY`, `VERIFY_TOKEN`, `TEST_KEY`, `META_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
@@ -26,7 +26,7 @@ Optional: `CLAUDE_MODEL` (default `claude-haiku-5-5`), `UA_EDITOR=0` to switch o
 
 ## Your pages (add `?key=YOUR_TEST_KEY`)
 - `/admin` — specialists, their data, links to send them; «🗑 Видалити» removes a test or unused account with all its chats and bookings
-- `/selftest` — real conversations through the AI (25 nails / 31 dental), pass/fail report (nothing is sent anywhere)
+- `/selftest` — real conversations through the AI (25 nails / 32 dental), pass/fail report (nothing is sent anywhere)
 - `/debug` — status, last AI error, last webhook visits
 - `/reset` — wipe test conversations and bookings
 - `/telegram/setup` — open once after deploying (buttons + menu)
@@ -74,5 +74,7 @@ One server serves both. Each client's data has `"niche"`: `"nails"` (default) or
    What the person wrote is remembered as the clinic's words, so the bot never «corrects» or contradicts it.
 4. A reply that was being prepared while a person answered is thrown away (no late «Тобто…» after the admin's answer).
 5. Messages that need no answer («ок, подумаю», spam) get none.
+6. A photo, video, file or voice message always goes to a person («Покажу лікарю і напишу вам.» / «Зараз послухаю і напишу вам.»),
+   and so does any reply where the bot promises to check something («зараз запитаю в лікаря») — then the bot stays out of that chat.
 
 After deploying: open `/selftest?key=…` → 🦷 and check the report.
