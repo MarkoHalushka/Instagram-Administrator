@@ -636,6 +636,21 @@ def main():
               not ig_sent() and any("дякує лікарці" in x[3] for x in tg_msgs("777")), tg_msgs("777"))
         clear(); SCRIPT.extend(["[SKIP]", "Консультація — 400 грн."]); dm(c, "а консультація скільки?", account="1784B", sender="d5")
         check("dental: a question is never left unanswered", [x[3] for x in ig_sent()] == ["Консультація — 400 грн."], ig_sent())
+        clear(); SCRIPT.append("Гарне фото. Схоже на звичайний наліт, нічого страшного.")
+        dm(c, None, account="1784B", sender="d7", attachments=[{"type": "image"}])
+        check("dental: photo → always handed to a person, even if the AI forgot the tag",
+              [x[3] for x in ig_sent()] == ["Покажу лікарю і напишу вам."] and app.is_paused(f"{tid}:d7")
+              and any("надіслав фото" in x[3] for x in tg_msgs("777")), (ig_sent(), tg_msgs("777")))
+        clear(); dm(c, "а скільки коштує чистка?", account="1784B", sender="d7")
+        check("dental: ...and the next question is NOT answered by the AI (goes to Telegram)",
+              not ig_sent() and any("на паузі" in x[3] for x in tg_msgs("777")), ig_sent())
+        clear(); SCRIPT.append("[SKIP]"); dm(c, None, account="1784B", sender="d8", attachments=[{"type": "audio"}])
+        check("dental: voice message → «Зараз послухаю і напишу вам.», person takes over",
+              [x[3] for x in ig_sent()] == ["Зараз послухаю і напишу вам."] and app.is_paused(f"{tid}:d8"), ig_sent())
+        clear(); SCRIPT.append("Точно не скажу, зараз запитаю в лікаря."); dm(c, "лікар працює з бінокулярами?", account="1784B", sender="d9")
+        check("dental: «зараз запитаю в лікаря» without a tag still hands over and stops the AI",
+              ig_sent() and app.is_paused(f"{tid}:d9") and any("Потрібна ваша відповідь" in x[3] for x in tg_msgs("777")),
+              (ig_sent(), app.is_paused(f"{tid}:d9")))
         REVIEW["fn"] = lambda d: {"ok": False, "problems": ["вигадка: про мікроскоп у даних нічого"], "fixed": "Зараз уточню.",
                                   "handoff": True}
         clear(); SCRIPT.append("Так, усі наші лікарі працюють з мікроскопом."); dm(c, "у вас є мікроскоп?", account="1784B", sender="d6")
